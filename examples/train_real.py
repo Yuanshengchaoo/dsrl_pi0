@@ -124,7 +124,14 @@ def main(variant):
         agent.restore_checkpoint(variant.restore_path)
 
     online_buffer_size = 2 * variant.max_steps  // variant.multi_grad_step
-    online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))
+    qc_use_best = bool(kwargs.get('qc_use_best_of_n', 0))
+    qc_num_candidates = int(kwargs.get('qc_num_candidates', 1)) if qc_use_best else 0
+    online_replay_buffer = ReplayBuffer(
+        dummy_env.observation_space,
+        dummy_env.action_space,
+        int(online_buffer_size),
+        qc_num_candidates=qc_num_candidates,
+    )
     replay_buffer = online_replay_buffer
     replay_buffer.seed(variant.seed)
     trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger, shard_fn=shard_fn, agent_dp=agent_dp, robot_config=robot_config)

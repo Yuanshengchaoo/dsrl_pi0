@@ -52,6 +52,10 @@ if __name__ == '__main__':
         num_qs=2,
         action_magnitude=2.5,
         num_cameras=3,
+        qc_use_best_of_n=0,
+        qc_num_candidates=4,
+        qc_eval_batch_size=16,
+        qc_prior_scale=1.0,
         )
 
     variant, args = parse_training_args(train_args_dict, parser)
