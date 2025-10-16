@@ -9,7 +9,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import numpy as np
 import copy
 import functools
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +33,7 @@ from jaxrl2.networks.learned_std_normal_policy import LearnedStdTanhNormalPolicy
 from jaxrl2.networks.values import StateActionEnsemble
 from jaxrl2.types import Params, PRNGKey
 from jaxrl2.utils.target_update import soft_target_update
+from jaxrl2.agents.qc_chunk import FlowMatchingChunkPrior, FlowMatchingChunkPriorConfig
 
 
 class TrainState(train_state.TrainState):
@@ -123,7 +124,12 @@ class PixelSACLearner(Agent):
                  num_qs: int = 2,
                  target_entropy: float = None,
                  action_magnitude: float = 1.0,
-                 num_cameras: int = 1
+                 num_cameras: int = 1,
+                 qc_use_best_of_n: bool = False,
+                 qc_num_candidates: int = 1,
+                 qc_eval_batch_size: int = 32,
+                 qc_prior_scale: float = 1.0,
+                 qc_prior_config: Optional[Dict[str, Any]] = None,
                  ):
         """
         An implementation of the version of Soft-Actor-Critic described in https://arxiv.org/abs/1812.05905
@@ -227,6 +233,38 @@ class PixelSACLearner(Agent):
             self.target_entropy = float(target_entropy)
         print(f'target_entropy: {self.target_entropy}')
         print(self.critic_reduction)
+
+        self._last_sample_info: Optional[Dict[str, Any]] = None
+        self._qc_use_best_of_n = bool(qc_use_best_of_n and qc_num_candidates > 0)
+        self._qc_num_candidates = int(max(1, qc_num_candidates))
+        self._qc_eval_batch_size = int(max(1, qc_eval_batch_size))
+        self._qc_prior: Optional[FlowMatchingChunkPrior] = None
+
+        if self._qc_use_best_of_n:
+            prior_cfg_kwargs = qc_prior_config.copy() if qc_prior_config else {}
+            if 'chunk_shape' in prior_cfg_kwargs:
+                prior_cfg_kwargs.pop('chunk_shape')
+            if 'scale' not in prior_cfg_kwargs:
+                prior_cfg_kwargs['scale'] = qc_prior_scale
+            if 'sample_observation' not in prior_cfg_kwargs:
+                prior_cfg_kwargs['sample_observation'] = observations
+            allowed_keys = {'checkpoint_path', 'model_def', 'sample_observation', 'init_rng', 'scale'}
+            unexpected = set(prior_cfg_kwargs.keys()) - allowed_keys
+            if unexpected:
+                raise ValueError(f"Unsupported qc_prior_config keys: {unexpected}")
+            prior_config = FlowMatchingChunkPriorConfig(
+                chunk_shape=self.action_chunk_shape,
+                **prior_cfg_kwargs,
+            )
+            self._qc_prior = FlowMatchingChunkPrior.from_config(prior_config)
+
+        def critic_apply(params, batch_stats, obs, actions):
+            input_collections = {'params': params}
+            if batch_stats is not None:
+                input_collections['batch_stats'] = batch_stats
+            return self._critic.apply_fn(input_collections, obs, actions)
+
+        self._critic_eval_fn = jax.jit(critic_apply)
         
 
     def update(self, batch: FrozenDict) -> Dict[str, float]:
@@ -240,6 +278,81 @@ class PixelSACLearner(Agent):
         self._target_critic_params = new_target_critic
         self._temp = new_temp
         return info
+
+    def _critic_batch_stats(self) -> Optional[Any]:
+        return getattr(self._critic, 'batch_stats', None)
+
+    def _evaluate_candidates(self, observations, candidates: jnp.ndarray) -> jnp.ndarray:
+        batch_size = candidates.shape[0]
+        num_candidates = candidates.shape[1]
+
+        obs_batched = jax.tree_util.tree_map(
+            lambda x: jnp.repeat(jnp.asarray(x), num_candidates, axis=0),
+            observations,
+        )
+        flat_candidates = candidates.reshape(batch_size * num_candidates, *candidates.shape[2:])
+
+        total = flat_candidates.shape[0]
+        chunk_qs = []
+        for start in range(0, total, self._qc_eval_batch_size):
+            end = min(start + self._qc_eval_batch_size, total)
+            obs_slice = jax.tree_util.tree_map(lambda x: x[start:end], obs_batched)
+            action_slice = flat_candidates[start:end]
+            qs_slice = self._critic_eval_fn(
+                self._critic.params,
+                self._critic_batch_stats(),
+                obs_slice,
+                action_slice,
+            )
+            if qs_slice.ndim == 1:
+                qs_slice = qs_slice[None, :]
+            chunk_qs.append(qs_slice)
+
+        qs = jnp.concatenate(chunk_qs, axis=1)
+        qs = qs.reshape(qs.shape[0], batch_size, num_candidates)
+
+        if self.critic_reduction == 'min':
+            reduced = qs.min(axis=0)
+        elif self.critic_reduction == 'mean':
+            reduced = qs.mean(axis=0)
+        else:
+            raise ValueError(f'Unsupported critic reduction: {self.critic_reduction}')
+
+        return reduced
+
+    def sample_actions(self, observations: np.ndarray) -> np.ndarray:
+        if not self._qc_use_best_of_n or self._qc_prior is None:
+            self._last_sample_info = None
+            return super().sample_actions(observations)
+
+        rng, key = jax.random.split(self._rng)
+        self._rng = rng
+
+        observations_jnp = jax.tree_util.tree_map(jnp.asarray, observations)
+        candidates, prior_info = self._qc_prior(key, observations_jnp, self._qc_num_candidates)
+
+        candidate_qs = self._evaluate_candidates(observations_jnp, candidates)
+        best_indices = jnp.argmax(candidate_qs, axis=1)
+
+        def select(cand, idx):
+            return cand[idx]
+
+        best_chunks = jax.vmap(select)(candidates, best_indices)
+        best_q = jnp.take_along_axis(candidate_qs, best_indices[:, None], axis=1).squeeze(-1)
+
+        self._last_sample_info = {
+            'qc_candidates': np.asarray(candidates),
+            'qc_candidate_q_values': np.asarray(candidate_qs),
+            'qc_best_index': np.asarray(best_indices),
+            'qc_best_q_value': np.asarray(best_q),
+            'prior_info': prior_info,
+        }
+
+        return np.asarray(best_chunks)
+
+    @property
+    def last_sample_info(self) -> Optional[Dict[str, Any]]:
+        return self._last_sample_info
 
     def perform_eval(self, variant, i, wandb_logger, eval_buffer, eval_buffer_iterator, eval_env):
         from examples.train_utils_sim import make_multiple_value_reward_visulizations

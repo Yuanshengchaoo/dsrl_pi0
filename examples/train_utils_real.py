@@ -97,6 +97,7 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
     episode_len = len(actions)
     rewards = np.array(traj['rewards'])
     masks = np.array(traj['masks'])
+    chunk_infos = traj.get('chunk_infos', [])
 
     for t in range(episode_len):
         obs = traj['observations'][t]
@@ -117,6 +118,20 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
             masks=masks[t],
             discount=variant.discount ** discount_horizon
         )
+        if chunk_infos:
+            info = chunk_infos[t] if t < len(chunk_infos) else None
+            if info is not None and info.get('qc_candidate_q_values') is not None:
+                candidate_qs = np.asarray(info['qc_candidate_q_values'])
+                if candidate_qs.ndim > 1:
+                    candidate_qs = candidate_qs.reshape(-1, candidate_qs.shape[-1])[0]
+                candidate_qs = candidate_qs.astype(np.float32)
+                best_index = int(np.asarray(info['qc_best_index']).reshape(-1)[0])
+                best_q = float(np.asarray(info['qc_best_q_value']).reshape(-1)[0])
+                insert_dict['qc'] = {
+                    'candidate_q_values': candidate_qs,
+                    'best_index': best_index,
+                    'best_q': best_q,
+                }
         online_replay_buffer.insert(insert_dict)
     online_replay_buffer.increment_traj_counter()
 
@@ -157,7 +172,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
     action_list = []
     obs_list = []
     image_list = []
-    actions = None
+    chunk_info_list = []
 
     old_settings = termios.tcgetattr(sys.stdin)
     noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
@@ -204,14 +219,18 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
                     'state': qpos[np.newaxis, ..., np.newaxis],
                 }
                 if i == 0:
-                    base_noise = jax.random.normal(key, (1, *action_chunk_shape))
-                    actions_noise = np.asarray(base_noise)[0, :noise_chunk_length, :]
+                    noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
+                    noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 10 - noise.shape[1], axis=1)
+                    noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
+                    actions_noise = noise[0, :agent.action_chunk_shape[0], :]
+                    chunk_info_list.append(None)
                 else:
                     # sac agent predicts the noise for diffusion model
                     actions_noise = agent.sample_actions(obs_dict)
-                    actions_noise = np.asarray(actions_noise).reshape(action_chunk_shape)
-                    base_noise = jax.numpy.asarray(actions_noise[None])
-                noise = pad_noise_to_horizon(base_noise)
+                    actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
+                    noise = np.repeat(actions_noise[-1:, :], 10 - actions_noise.shape[0], axis=0)
+                    noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
+                    chunk_info_list.append(agent.last_sample_info)
                 action_list.append(actions_noise)
                 obs_list.append(obs_dict)
                 actions = np.asarray(agent_dp.infer(request_data, noise=np.asarray(noise))["actions"])
@@ -317,6 +336,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
         'masks': masks,
         'is_success': is_success,
         'env_steps': t + 1,
+        'chunk_infos': chunk_info_list,
     }
     
     return traj

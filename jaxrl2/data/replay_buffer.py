@@ -26,11 +26,12 @@ def _init_replay_dict(obs_space: gym.Space,
 
 
 class ReplayBuffer(Dataset):
-    
-    def __init__(self, observation_space: gym.Space, action_space: gym.Space, capacity: int, ):
+
+    def __init__(self, observation_space: gym.Space, action_space: gym.Space, capacity: int, qc_num_candidates: int = 0):
         self.observation_space = observation_space
         self.action_space = action_space
         self.capacity = capacity
+        self.qc_num_candidates = int(max(0, qc_num_candidates))
 
         print("making replay buffer of capacity ", self.capacity)
 
@@ -51,6 +52,13 @@ class ReplayBuffer(Dataset):
             'masks': masks,
             'discount': discount,
         }
+
+        if self.qc_num_candidates > 0:
+            self.data['qc'] = {
+                'candidate_q_values': np.empty((self.capacity, self.qc_num_candidates), dtype=np.float32),
+                'best_index': np.empty((self.capacity,), dtype=np.int32),
+                'best_q': np.empty((self.capacity,), dtype=np.float32),
+            }
 
         self.size = 0
         self._traj_counter = 0
@@ -133,6 +141,13 @@ class ReplayBuffer(Dataset):
                 'discount': discount,
             }
 
+            if self.qc_num_candidates > 0:
+                data_new['qc'] = {
+                    'candidate_q_values': np.empty((self.capacity, self.qc_num_candidates), dtype=np.float32),
+                    'best_index': np.empty((self.capacity,), dtype=np.int32),
+                    'best_q': np.empty((self.capacity,), dtype=np.float32),
+                }
+
             for x in data_new:
                 if isinstance(self.data[x], np.ndarray):
                     self.data[x] = np.concatenate((self.data[x], data_new[x]), axis=0)
@@ -149,7 +164,7 @@ class ReplayBuffer(Dataset):
                 if isinstance(data_dict[x], dict):
                     for y in data_dict[x]:
                         self.data[x][y][self.size] = data_dict[x][y]
-                else:                        
+                else:
                     self.data[x][self.size] = data_dict[x]
         self.size += 1
     
