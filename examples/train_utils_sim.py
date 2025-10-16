@@ -207,9 +207,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     action_list = []
     obs_list = []
 
+    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
+    action_dim = agent.action_chunk_shape[-1]
+
     for t in tqdm(range(max_timesteps)):
         curr_image = obs_to_img(obs, variant)
-        
+
         qpos = obs_to_qpos(obs, variant)
 
         if variant.add_states:
@@ -230,17 +233,17 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
             obs_pi_zero = obs_to_pi_zero_input(obs, variant)
             if i == 0:
                 # for initial round of data collection, we sample from standard gaussian noise
-                noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
+                noise = jax.random.normal(key, (1, noise_chunk_length, action_dim))
                 noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 50 - noise.shape[1], axis=1)
                 noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
-                actions_noise = noise[0, :agent.action_chunk_shape[0], :]
+                actions_noise = noise[0, :noise_chunk_length, :]
             else:
                 # sac agent predicts the noise for diffusion model
                 actions_noise = agent.sample_actions(obs_dict)
-                actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
+                actions_noise = np.reshape(actions_noise, (noise_chunk_length, action_dim))
                 noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
                 noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
-            
+
             actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
             action_list.append(actions_noise)
             obs_list.append(obs_dict)
@@ -308,6 +311,8 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
     episode_lens = []
 
     rng = jax.random.PRNGKey(variant.seed+456)
+    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
+    action_dim = agent.action_chunk_shape[-1]
 
     for rollout_id in range(variant.eval_episodes):
         if 'libero' in variant.env:
@@ -345,10 +350,10 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
                     noise = jax.random.normal(rng, (1, 50, 32))
                 else:
                     actions_noise = agent.sample_actions(obs_dict)
-                    actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
+                    actions_noise = np.reshape(actions_noise, (noise_chunk_length, action_dim))
                     noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
                     noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
-                    
+
                 actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
               
             action_t = actions[t % query_frequency]

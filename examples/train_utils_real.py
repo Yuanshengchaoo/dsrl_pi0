@@ -124,9 +124,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
     image_list = []
 
     old_settings = termios.tcgetattr(sys.stdin)
+    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
+    action_dim = agent.action_chunk_shape[-1]
+
     try:
         tty.setcbreak(sys.stdin.fileno())
-        for t in tqdm(range(max_timesteps)):    
+        for t in tqdm(range(max_timesteps)):
             # Check for keyboard input
             if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
                 char_input = sys.stdin.read(1)
@@ -154,7 +157,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
                 rng, key = jax.random.split(rng)
 
                 img_all = process_images(variant, curr_obs)
-                
+
                 # extract the feature from the pi0 VLM backbone and concat with the qpos as states
                 img_rep_pi0, _ = agent_dp.get_prefix_rep(request_data)
                 img_rep_pi0 = img_rep_pi0[:, -1, :] # (1, 2048)
@@ -165,14 +168,14 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
                     'state': qpos[np.newaxis, ..., np.newaxis],
                 }
                 if i == 0:
-                    noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
+                    noise = jax.random.normal(key, (1, noise_chunk_length, action_dim))
                     noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 10 - noise.shape[1], axis=1)
                     noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
-                    actions_noise = noise[0, :agent.action_chunk_shape[0], :]
+                    actions_noise = noise[0, :noise_chunk_length, :]
                 else:
                     # sac agent predicts the noise for diffusion model
                     actions_noise = agent.sample_actions(obs_dict)
-                    actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
+                    actions_noise = np.reshape(actions_noise, (noise_chunk_length, action_dim))
                     noise = np.repeat(actions_noise[-1:, :], 10 - actions_noise.shape[0], axis=0)
                     noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
                 action_list.append(actions_noise)
