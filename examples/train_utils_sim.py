@@ -239,9 +239,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None, action_chunk_shape=None,
     obs_list = []
     actions = None
 
+    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
+    action_dim = agent.action_chunk_shape[-1]
+
     for t in tqdm(range(max_timesteps)):
         curr_image = obs_to_img(obs, variant)
-        
+
         qpos = obs_to_qpos(obs, variant)
 
         if variant.add_states:

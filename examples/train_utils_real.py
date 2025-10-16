@@ -160,9 +160,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
     actions = None
 
     old_settings = termios.tcgetattr(sys.stdin)
+    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
+    action_dim = agent.action_chunk_shape[-1]
+
     try:
         tty.setcbreak(sys.stdin.fileno())
-        for t in tqdm(range(max_timesteps)):    
+        for t in tqdm(range(max_timesteps)):
             # Check for keyboard input
             if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
                 char_input = sys.stdin.read(1)
