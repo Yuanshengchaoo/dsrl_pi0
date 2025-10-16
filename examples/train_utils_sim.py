@@ -99,10 +99,25 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
     wandb_logger.log({'num_online_samples': 0}, step=i)
     wandb_logger.log({'num_online_trajs': 0}, step=i)
     wandb_logger.log({'env_steps': 0}, step=i)
+
+    action_chunk_shape = agent.action_chunk_shape
+    diffusion_steps = getattr(variant, 'diffusion_steps', None)
+    if diffusion_steps is None:
+        raise ValueError('variant.diffusion_steps must be specified for trajectory collection.')
+    if getattr(variant, 'query_freq', -1) <= 0:
+        variant.query_freq = diffusion_steps
     
     with tqdm(total=variant.max_steps, initial=0) as pbar:
         while i <= variant.max_steps:
-            traj = collect_traj(variant, agent, env, i, agent_dp)
+            traj = collect_traj(
+                variant,
+                agent,
+                env,
+                i,
+                agent_dp,
+                action_chunk_shape=action_chunk_shape,
+                diffusion_steps=diffusion_steps,
+            )
             traj_id = online_replay_buffer._traj_counter
             add_online_data_to_buffer(variant, traj, online_replay_buffer)
             total_env_steps += traj['env_steps']
@@ -162,7 +177,7 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
             
 def add_online_data_to_buffer(variant, traj, online_replay_buffer):
 
-    discount_horizon = variant.query_freq
+    discount_horizon = variant.diffusion_steps
     actions = np.array(traj['actions']) # (T, chunk_size, action_dim )
     episode_len = len(actions)
     rewards = np.array(traj['rewards'])
@@ -190,7 +205,23 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
         online_replay_buffer.insert(insert_dict)
     online_replay_buffer.increment_traj_counter()
 
-def collect_traj(variant, agent, env, i, agent_dp=None):
+def collect_traj(variant, agent, env, i, agent_dp=None, action_chunk_shape=None, diffusion_steps=None):
+    if action_chunk_shape is None:
+        action_chunk_shape = agent.action_chunk_shape
+    if diffusion_steps is None:
+        diffusion_steps = variant.diffusion_steps
+
+    noise_chunk_length = action_chunk_shape[0]
+
+    def pad_noise_to_horizon(noise_seq):
+        extra = diffusion_steps - noise_seq.shape[1]
+        if extra > 0:
+            pad = jax.numpy.repeat(noise_seq[:, -1:, :], extra, axis=1)
+            noise_seq = jax.numpy.concatenate([noise_seq, pad], axis=1)
+        elif extra < 0:
+            noise_seq = noise_seq[:, :diffusion_steps, :]
+        return noise_seq
+
     query_frequency = variant.query_freq
     max_timesteps = variant.max_timesteps
     env_max_reward = variant.env_max_reward
@@ -206,6 +237,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     rewards = []
     action_list = []
     obs_list = []
+    actions = None
 
     noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
     action_dim = agent.action_chunk_shape[-1]
@@ -233,21 +265,19 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
             obs_pi_zero = obs_to_pi_zero_input(obs, variant)
             if i == 0:
                 # for initial round of data collection, we sample from standard gaussian noise
-                noise = jax.random.normal(key, (1, noise_chunk_length, action_dim))
-                noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 50 - noise.shape[1], axis=1)
-                noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
-                actions_noise = noise[0, :noise_chunk_length, :]
+                base_noise = jax.random.normal(key, (1, *action_chunk_shape))
+                actions_noise = np.asarray(base_noise)[0, :noise_chunk_length, :]
             else:
                 # sac agent predicts the noise for diffusion model
                 actions_noise = agent.sample_actions(obs_dict)
-                actions_noise = np.reshape(actions_noise, (noise_chunk_length, action_dim))
-                noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
-                noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
+                actions_noise = np.asarray(actions_noise).reshape(action_chunk_shape)
+                base_noise = jax.numpy.asarray(actions_noise[None])
+            noise = pad_noise_to_horizon(base_noise)
 
-            actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
+            actions = np.asarray(agent_dp.infer(obs_pi_zero, noise=np.asarray(noise))["actions"])
             action_list.append(actions_noise)
             obs_list.append(obs_dict)
-     
+
         action_t = actions[t % query_frequency]
         if 'libero' in variant.env:
             obs, reward, done, _ = env.step(action_t)
@@ -280,14 +310,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     '''
     We use sparse -1/0 reward to train the SAC agent.
     '''
-    if is_success:
-        query_steps = len(action_list)
-        rewards = np.concatenate([-np.ones(query_steps - 1), [0]])
-        masks = np.concatenate([np.ones(query_steps - 1), [0]])
-    else:
-        query_steps = len(action_list)
-        rewards = -np.ones(query_steps)
-        masks = np.ones(query_steps)
+    query_steps = len(action_list)
+    rewards = -np.ones(query_steps)
+    masks = np.ones(query_steps)
+    if is_success and query_steps > 0:
+        rewards[-1] = 0
+        masks[-1] = 0
 
     return {
         'observations': obs_list,
@@ -301,6 +329,11 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     }
 
 def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
+    diffusion_steps = getattr(variant, 'diffusion_steps', None)
+    if diffusion_steps is None:
+        raise ValueError('variant.diffusion_steps must be specified for evaluation.')
+    if getattr(variant, 'query_freq', -1) <= 0:
+        variant.query_freq = diffusion_steps
     query_frequency = variant.query_freq
     print('query frequency', query_frequency)
     max_timesteps = variant.max_timesteps
@@ -311,8 +344,17 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
     episode_lens = []
 
     rng = jax.random.PRNGKey(variant.seed+456)
-    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
-    action_dim = agent.action_chunk_shape[-1]
+    action_chunk_shape = agent.action_chunk_shape
+    noise_chunk_length = action_chunk_shape[0]
+
+    def pad_noise_to_horizon(noise_seq):
+        extra = diffusion_steps - noise_seq.shape[1]
+        if extra > 0:
+            pad = jax.numpy.repeat(noise_seq[:, -1:, :], extra, axis=1)
+            noise_seq = jax.numpy.concatenate([noise_seq, pad], axis=1)
+        elif extra < 0:
+            noise_seq = noise_seq[:, :diffusion_steps, :]
+        return noise_seq
 
     for rollout_id in range(variant.eval_episodes):
         if 'libero' in variant.env:
@@ -341,20 +383,21 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
 
                 rng, key = jax.random.split(rng)
                 assert agent_dp is not None
-                
+
                 obs_pi_zero = obs_to_pi_zero_input(obs, variant)
-                
-                
+
+
                 if i == 0:
-                    # for initial evaluation, we sample from standard gaussian noise to evaluate the base policy's performance
-                    noise = jax.random.normal(rng, (1, 50, 32))
+                    base_noise = jax.random.normal(key, (1, *action_chunk_shape))
+                    actions_noise = np.asarray(base_noise)[0, :noise_chunk_length, :]
                 else:
                     actions_noise = agent.sample_actions(obs_dict)
-                    actions_noise = np.reshape(actions_noise, (noise_chunk_length, action_dim))
-                    noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
-                    noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
+                    actions_noise = np.asarray(actions_noise).reshape(action_chunk_shape)
+                    base_noise = jax.numpy.asarray(actions_noise[None])
 
-                actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
+                noise = pad_noise_to_horizon(base_noise)
+
+                actions = np.asarray(agent_dp.infer(obs_pi_zero, noise=np.asarray(noise))["actions"])
               
             action_t = actions[t % query_frequency]
             
