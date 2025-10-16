@@ -24,10 +24,28 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
     wandb_logger.log({'num_online_samples': 0}, step=i)
     wandb_logger.log({'num_online_trajs': 0}, step=i)
     wandb_logger.log({'env_steps': 0}, step=i)
+
+    action_chunk_shape = agent.action_chunk_shape
+    diffusion_steps = getattr(variant, 'diffusion_steps', None)
+    if diffusion_steps is None:
+        raise ValueError('variant.diffusion_steps must be specified for trajectory collection.')
+    if getattr(variant, 'query_freq', -1) <= 0:
+        variant.query_freq = diffusion_steps
    
     with tqdm(total=variant.max_steps, initial=0) as pbar:
         while i <= variant.max_steps:
-            traj = collect_traj(variant, agent, env, i, agent_dp, wandb_logger, total_num_traj, robot_config)
+            traj = collect_traj(
+                variant,
+                agent,
+                env,
+                i,
+                agent_dp,
+                wandb_logger,
+                total_num_traj,
+                robot_config,
+                action_chunk_shape=action_chunk_shape,
+                diffusion_steps=diffusion_steps,
+            )
             total_num_traj += 1
             add_online_data_to_buffer(variant, traj, online_replay_buffer)
             total_env_steps += traj['env_steps']
@@ -74,7 +92,7 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
             
 def add_online_data_to_buffer(variant, traj, online_replay_buffer):
     
-    discount_horizon = variant.query_freq
+    discount_horizon = variant.diffusion_steps
     actions = np.array(traj['actions']) # (T, chunk_size, 14)
     episode_len = len(actions)
     rewards = np.array(traj['rewards'])
@@ -117,7 +135,24 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
         online_replay_buffer.insert(insert_dict)
     online_replay_buffer.increment_traj_counter()
 
-def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_id=None, robot_config=None):
+def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_id=None, robot_config=None,
+                 action_chunk_shape=None, diffusion_steps=None):
+    if action_chunk_shape is None:
+        action_chunk_shape = agent.action_chunk_shape
+    if diffusion_steps is None:
+        diffusion_steps = variant.diffusion_steps
+
+    noise_chunk_length = action_chunk_shape[0]
+
+    def pad_noise_to_horizon(noise_seq):
+        extra = diffusion_steps - noise_seq.shape[1]
+        if extra > 0:
+            pad = jax.numpy.repeat(noise_seq[:, -1:, :], extra, axis=1)
+            noise_seq = jax.numpy.concatenate([noise_seq, pad], axis=1)
+        elif extra < 0:
+            noise_seq = noise_seq[:, :diffusion_steps, :]
+        return noise_seq
+
     query_frequency = variant.query_freq
     instruction = variant.instruction
     max_timesteps = robot_config['max_timesteps']
@@ -140,9 +175,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
     chunk_info_list = []
 
     old_settings = termios.tcgetattr(sys.stdin)
+    noise_chunk_length = getattr(variant, 'noise_chunk_length', agent.action_chunk_shape[0])
+    action_dim = agent.action_chunk_shape[-1]
+
     try:
         tty.setcbreak(sys.stdin.fileno())
-        for t in tqdm(range(max_timesteps)):    
+        for t in tqdm(range(max_timesteps)):
             # Check for keyboard input
             if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
                 char_input = sys.stdin.read(1)
@@ -170,7 +208,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
                 rng, key = jax.random.split(rng)
 
                 img_all = process_images(variant, curr_obs)
-                
+
                 # extract the feature from the pi0 VLM backbone and concat with the qpos as states
                 img_rep_pi0, _ = agent_dp.get_prefix_rep(request_data)
                 img_rep_pi0 = img_rep_pi0[:, -1, :] # (1, 2048)
@@ -195,9 +233,9 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
                     chunk_info_list.append(agent.last_sample_info)
                 action_list.append(actions_noise)
                 obs_list.append(obs_dict)
-                action = agent_dp.infer(request_data, noise=np.asarray(noise))["actions"]
+                actions = np.asarray(agent_dp.infer(request_data, noise=np.asarray(noise))["actions"])
 
-            action_t = action[t % query_frequency]
+            action_t = actions[t % query_frequency]
             
             # binarize gripper action.
             if action_t[-1].item() > 0.5:
@@ -265,14 +303,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
         print(f'Rollout Done')
         
     finally:
-        if is_success:
-            query_steps = len(action_list)
-            rewards = np.concatenate([-np.ones(query_steps - 1), [0]])
-            masks = np.concatenate([np.ones(query_steps - 1), [0]])
-        else:
-            query_steps = len(action_list)
-            rewards = -np.ones(query_steps)
-            masks = np.ones(query_steps)
+        query_steps = len(action_list)
+        rewards = -np.ones(query_steps)
+        masks = np.ones(query_steps)
+        if is_success and query_steps > 0:
+            rewards[-1] = 0
+            masks[-1] = 0
             
         if wandb_logger is not None:
             wandb_logger.log({f'is_success': int(is_success)}, step=i)
