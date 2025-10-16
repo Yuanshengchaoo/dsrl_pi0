@@ -25,6 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--multi_grad_step', default=1, help='Number of graident steps to take per environment step, aka UTD', type=int)
     parser.add_argument('--resize_image', default=-1, help='the size of image if need resizing', type=int)
     parser.add_argument('--query_freq', default=-1, help='query frequency', type=int)
+    parser.add_argument('--diffusion_steps', default=10, help='diffusion horizon length', type=int)
     parser.add_argument('--instruction', default='put the spoon on the plate', help='language instruction for the robot')
     
     # The hyperparameters for the real robot experiments
